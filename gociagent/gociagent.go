@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"time"
 )
 
 var adbserver *adb.ADBServer
@@ -66,23 +65,7 @@ func reportself(w http.ResponseWriter, r *http.Request) {
 func DeviceMonitor() {
 	fmt.Println("DeviceMonitor")
 	adbserver = &adb.ADBServer{
-		Devices: make([]adb.Device, 0),
+		Devices: make([]*adb.Device, 0),
 	}
-	ticker := time.NewTicker(5 * time.Second)
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case <-done:
-				fmt.Println("DeviceMonitor done")
-				return
-			case <-ticker.C:
-				adbserver.RefreshDevice()
-				//log.SetOutput(loggia)
-				// for _, value := range adbserver.Devices {
-				// 	fmt.Printf("main device: %v, wireless %v, wire %v\n", value.SN, value.WirelessConnected, value.WireConnected)
-				// }
-			}
-		}
-	}()
+	adbserver.GoRefreshDevice()
 }

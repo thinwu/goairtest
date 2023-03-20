@@ -6,22 +6,25 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	IP_PORT_REGEXP                 = `(\d+\.\d+\.\d+\.\d+):\d+`
-	DEVICE_LIST_TITLE_LINE         = "List of devices attached"
-	DEVICE_SUFFIX_CONNECTED        = "device"
-	DEVICE_INET_REGEXP             = `(inet\s)(\d+\.\d+\.\d+\.\d+)`
-	DEVICE_TCPIP_CONNECTED         = "connected to"
-	TCPIP_ALLREADY_CONNECTED       = "already connected to"
-	DEVICE_SUFFIX_OFFLINE          = "offline"
-	DEVICE_AWAKE                   = "interactiveState=INTERACTIVE_STATE_AWAKE"
-	DEVICE_ASLEEP                  = "interactiveState=INTERACTIVE_STATE_SLEEP"
-	DEVICE_LOCKED                  = "mInputRestricted=true"
-	DEVICE_UNLOCKED                = "mInputRestricted=false"
-	_DEVIVE_SELFCHECK_INTERVAL_SEC = 10
+	IP_PORT_REGEXP                      = `(\d+\.\d+\.\d+\.\d+):\d+`
+	DEVICE_LIST_TITLE_LINE              = "List of devices attached"
+	DEVICE_SUFFIX_CONNECTED             = "device"
+	DEVICE_INET_REGEXP                  = `(inet\s)(\d+\.\d+\.\d+\.\d+)`
+	DEVICE_TCPIP_CONNECTED              = "connected to"
+	TCPIP_ALLREADY_CONNECTED            = "already connected to"
+	DEVICE_SUFFIX_OFFLINE               = "offline"
+	DEVICE_AWAKE                        = "interactiveState=INTERACTIVE_STATE_AWAKE"
+	DEVICE_ASLEEP                       = "interactiveState=INTERACTIVE_STATE_SLEEP"
+	DEVICE_LOCKED                       = "mInputRestricted=true"
+	DEVICE_UNLOCKED                     = "mInputRestricted=false"
+	_DEVIVE_SELFCHECK_INTERVAL_SEC      = 10
+	_SERVER_REFRESH_DEVIVE_INTERVAL_SEC = 30
+	_DEVICE_SHELL_SN                    = "getprop ro.boot.serialno"
 )
 
 type Message struct {
@@ -40,9 +43,25 @@ type Device struct {
 	Invalid              chan bool
 	Idle                 bool
 	C                    chan Message
+	ADBServer            *ADBServer
+}
+type ADBServer struct {
+	Devices    []*Device
+	deviceLock sync.RWMutex
 }
 
-func (d *Device) listenToCmdAndRun() {
+func adbCmd(args ...string) []byte {
+	cmd := exec.Command("adb", args...)
+	out, err := cmd.Output()
+	log.Printf("adbCmd: %v ", string(out))
+	if err != nil {
+		log.Printf("err adbCmd: %v \n\t%v", args, err)
+		return nil
+	}
+	return out
+}
+
+func (d *Device) goRunCmd() {
 	go func() {
 		for {
 			fmt.Printf("device %v listenToCmdAndRun", d.SN)
@@ -50,7 +69,6 @@ func (d *Device) listenToCmdAndRun() {
 			d.adbShellCmd(msg.UsingCableConn, msg.Cmd)
 		}
 	}()
-
 }
 
 func isIPPortValid(ip_port string) (string, bool) {
@@ -66,26 +84,17 @@ func isIPPortValid(ip_port string) (string, bool) {
 func (d *Device) IP_Port() string {
 	return fmt.Sprintf("%s:%s", d.IP, d.Port)
 }
-func newDevice() *Device {
-	return &Device{}
-}
-
-type ADBServer struct {
-	Devices []*Device
-}
-
-func adbCmd(args ...string) []byte {
-	cmd := exec.Command("adb", args...)
-	out, err := cmd.Output()
-	log.Printf("adbCmd: %v ", string(out))
-	if err != nil {
-		log.Printf("err adbCmd: %v \n\t%v", args, err)
-		return nil
-	}
-	return out
+func newDevice(sn, ip, port string) *Device {
+	d := &Device{SN: sn, IP: ip, Port: port}
+	d.goSelfCheck()
+	d.goRunCmd()
+	return d
 }
 
 func (d *Device) adbCmd(args ...string) []byte {
+	if d.SN == "" {
+		return nil
+	}
 	var cmd = append([]string{"-s", d.SN}, args...)
 	return adbCmd(cmd...)
 }
@@ -122,9 +131,9 @@ func (d *Device) adbShellCmd(cablePriority bool, args ...string) []byte {
 	return adbCmd(cmd...)
 }
 
-func (d *Device) openDeviceDefaultPort() {
+func (d *Device) openDeviceDefaultPort() []byte {
 	port := "5555"
-	d.openDevicePort(port)
+	return d.openDevicePort(port)
 }
 
 func (d *Device) openDevicePort(port string) []byte {
@@ -136,20 +145,52 @@ func (d *Device) openDevicePort(port string) []byte {
 func (d *Device) disconnect() []byte {
 	return adbCmd("disconnect", d.IP_Port())
 }
-func (d *Device) getSerialNO() {
-	out := d.adbShellCmd(false, "getprop", "ro.boot.serialno")
-	d.SN = strings.TrimSpace(string(out))
+func (d *Device) getSerialNo(cablePriority bool) bool {
+	out := d.adbShellCmd(cablePriority, "getprop", "ro.boot.serialno")
+	if out == nil {
+		return false
+	} else {
+		d.SN = strings.TrimSpace(string(out))
+		return true
+	}
 }
-func (d *Device) getIP() {
+func (d *Device) getIP() bool {
 	out := d.adbShellCmd(true, "ip", "-f", "inet", "addr", "show")
-	re := regexp.MustCompile(DEVICE_INET_REGEXP)
-	match := re.FindAllStringSubmatch(string(out), -1)
-	var ip string
-	for i := 0; i < len(match); i++ {
-		ip = match[i][2]
-		if ip != "127.0.0.1" {
-			d.IP = ip
+	if out != nil {
+		re := regexp.MustCompile(DEVICE_INET_REGEXP)
+		match := re.FindAllStringSubmatch(string(out), -1)
+		var ip string
+		for i := 0; i < len(match); i++ {
+			ip = match[i][2]
+			if ip != "127.0.0.1" {
+				d.IP = ip
+				return true
+			}
 		}
+	}
+	return false
+}
+func (d *Device) selfCheck() {
+	timestamp := time.Now().Unix()
+	if d.getSerialNo(true) == false {
+		d.WireConnected = false
+	} else {
+		d.WireConnected = true
+	}
+	d.WireRefreshToken = timestamp
+
+	if d.getSerialNo(false) == false {
+		if !d.firstTimeConnectTcpIP() {
+			d.WirelessConnected = false
+		} else {
+			d.WirelessConnected = true
+		}
+	} else {
+		d.WirelessConnected = true
+	}
+	d.WirelessRefreshToken = timestamp
+	if !d.WireConnected && !d.WirelessConnected {
+		d.Invalid <- false
 	}
 }
 func (d *Device) goSelfCheck() {
@@ -159,17 +200,11 @@ func (d *Device) goSelfCheck() {
 			select {
 			case <-d.Invalid:
 				fmt.Printf("device %v is Invalid", d.SN)
+				d.ADBServer.removeDevice(d)
 				return
 			case <-ticker.C:
-				if d.adbShellCmd(true, "getprop ro.boot.serialno") == nil {
-					d.WireConnected = false
-
-				} else if d.adbShellCmd(false, "getprop ro.boot.serialno") == nil {
-					d.WirelessConnected = false
-				}
-				if !d.WireConnected && !d.WirelessConnected {
-					d.Invalid <- false
-				}
+				d.selfCheck()
+				return
 			}
 		}
 	}()
@@ -191,9 +226,13 @@ func (d *Device) reconnect() bool {
 	return false
 }
 func (d *Device) firstTimeConnectTcpIP() bool {
-	d.openDeviceDefaultPort()
-	d.getIP()
-	return d.connect()
+	ret := d.openDeviceDefaultPort()
+	if ret != nil {
+		if d.getIP() {
+			return d.connect()
+		}
+	}
+	return false
 }
 
 func (d *Device) UnlockPhone() {
@@ -216,24 +255,37 @@ func (d *Device) UnlockPhone() {
 	}
 }
 
-func (s *ADBServer) getNonFreshedDevice(sn_or_ipPort string, refreshToken int64) (*Device, bool) { // found refreshed
-	for id, d := range s.Devices {
-		if d.SN == sn_or_ipPort || d.IP_Port() == sn_or_ipPort {
-			if refreshToken != d.WireRefreshToken || refreshToken != d.WirelessRefreshToken {
-				return s.Devices[id], false
-			}
-			return s.Devices[id], true
+func (s *ADBServer) removeDevice(invalidDevice *Device) {
+	s.deviceLock.Lock()
+	i := 0
+	for _, d := range s.Devices {
+		if d != invalidDevice {
+			s.Devices[i] = d
+			i++
 		}
 	}
-	return nil, false
+	for j := i; j < len(s.Devices); j++ {
+		s.Devices[j] = nil
+	}
+	s.Devices = s.Devices[:i]
+	s.deviceLock.Unlock()
 }
+
 func (s *ADBServer) GetDevice(sn_or_ipPort string) *Device {
+	s.deviceLock.RLock()
 	for _, d := range s.Devices {
 		if d.SN == sn_or_ipPort || d.IP_Port() == sn_or_ipPort {
 			return d
 		}
 	}
+	s.deviceLock.RUnlock()
 	return nil
+}
+
+func (s *ADBServer) AppendDevice(d *Device) {
+	s.deviceLock.Lock()
+	s.Devices = append(s.Devices, d)
+	s.deviceLock.Unlock()
 }
 func (s *ADBServer) GetFirstAvailableDevice() *Device {
 	for _, d := range s.Devices {
@@ -244,90 +296,32 @@ func (s *ADBServer) GetFirstAvailableDevice() *Device {
 	return nil
 }
 
-func (s *ADBServer) RefreshDevice() {
-	out := adbCmd("devices")
-	timestamp := time.Now().Unix()
-	deviceOutputs := strings.Split(strings.TrimSpace(string(out)), "\r")
-	for i := len(deviceOutputs) - 1; deviceOutputs[i] != DEVICE_LIST_TITLE_LINE && i >= 0; i-- { // adb devices connected to the server
-		deviceInfo := strings.Split(deviceOutputs[i], "\t") // first elem is sn or ipport, 2nd is the status: device or offline
-		deviceId := strings.TrimSpace(deviceInfo[0])
-		deviceStatus := strings.TrimSpace(deviceInfo[1])
-		d, refreshed := s.getNonFreshedDevice(deviceId, timestamp)
-		ip_port, isValidIP_Port := isIPPortValid(deviceId)
-		if d != nil && !refreshed {
-			if !isValidIP_Port {
-				d.WireConnected = true
-				d.WireRefreshToken = timestamp
-			} else {
-				if strings.Contains(deviceStatus, DEVICE_SUFFIX_CONNECTED) {
-					d.WirelessConnected = true
-				} else if strings.Contains(deviceStatus, DEVICE_SUFFIX_OFFLINE) {
-					// d.Invalid = true
-					d.Idle = true
-					connected := d.reconnect() // try reconnect
-					if connected {
-						// d.Invalid = false
-						d.WirelessConnected = true
-					} else { // reconnect failed
-						d.WirelessConnected = false
+func (s *ADBServer) GoRefreshDevice() {
+	ticker := time.NewTicker(_SERVER_REFRESH_DEVIVE_INTERVAL_SEC * time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				out := adbCmd("devices")
+				deviceOutputs := strings.Split(strings.TrimSpace(string(out)), "\r")
+				for i := len(deviceOutputs) - 1; deviceOutputs[i] != DEVICE_LIST_TITLE_LINE && i >= 0; i-- { // adb devices connected to the server
+					deviceInfo := strings.Split(deviceOutputs[i], "\t") // first elem is sn or ipport, 2nd is the status: device or offline
+					deviceId := strings.TrimSpace(deviceInfo[0])
+					if s.GetDevice(deviceId) == nil {
+						ip_port, valid := isIPPortValid(deviceId)
+						if valid {
+							ip := strings.Split(ip_port, ":")[0]
+							port := strings.Split(ip_port, ":")[1]
+							nd := newDevice("", ip, port)
+							s.AppendDevice(nd)
+						} else {
+							nd := newDevice(deviceId, "", "")
+							s.AppendDevice(nd)
+						}
 					}
 				}
-				d.WirelessRefreshToken = timestamp
-			}
-		} else if d == nil { // new device
-			nd := newDevice()
-			nd.Idle = true
-			// nd.Invalid = false
-			if ip_port == "" {
-				nd.SN = deviceId
-				nd.WireConnected = true
-				nd.firstTimeConnectTcpIP()
-				nd.WirelessConnected = true
-				nd.WirelessRefreshToken = timestamp
-				nd.WireRefreshToken = timestamp
-			} else {
-				if strings.Contains(deviceStatus, DEVICE_SUFFIX_CONNECTED) {
-					ip := strings.Split(ip_port, ":")[0]
-					port := strings.Split(ip_port, ":")[1]
-					nd.IP = ip
-					nd.Port = port
-					nd.getSerialNO() // in case ip changed
-					nd.WirelessConnected = true
-					nd.WirelessRefreshToken = timestamp
-				} else if strings.Contains(deviceStatus, DEVICE_SUFFIX_OFFLINE) {
-					connected := nd.reconnect() // try reconnect
-					if connected {
-						nd.getSerialNO()
-						nd.WirelessConnected = true
-					} else { // reconnect failed
-						nd.WirelessConnected = false
-					}
-					nd.WirelessRefreshToken = timestamp
-				}
-			}
-			s.Devices = append(s.Devices, nd)
-		}
-	}
-	for id, _ := range s.Devices {
-		if s.Devices[id].WireRefreshToken < timestamp {
-			s.Devices[id].WireConnected = false
-		}
-		if s.Devices[id].WirelessRefreshToken < timestamp {
-			s.Devices[id].WirelessConnected = false
-			if s.Devices[id].WireConnected && s.Devices[id].WireRefreshToken == timestamp {
-				s.Devices[id].firstTimeConnectTcpIP()
-				s.Devices[id].WirelessConnected = true
-				s.Devices[id].WirelessRefreshToken = timestamp
+				return
 			}
 		}
-		if !s.Devices[id].WireConnected && !s.Devices[id].WirelessConnected {
-			// s.Devices[id].Invalid = false
-			s.Devices[id].Idle = false
-		}
-		if s.Devices[id].Idle {
-			//  && !s.Devices[id].Invalid{
-			s.Devices[id].listenToCmdAndRun()
-			s.Devices[id].goSelfCheck()
-		}
-	}
+	}()
 }
