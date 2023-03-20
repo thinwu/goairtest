@@ -10,22 +10,23 @@ import (
 )
 
 const (
-	IP_PORT_REGEXP           = `(\d+\.\d+\.\d+\.\d+):\d+`
-	DEVICE_LIST_TITLE_LINE   = "List of devices attached"
-	DEVICE_SUFFIX_CONNECTED  = "device"
-	DEVICE_INET_REGEXP       = `(inet\s)(\d+\.\d+\.\d+\.\d+)`
-	DEVICE_TCPIP_CONNECTED   = "connected to"
-	TCPIP_ALLREADY_CONNECTED = "already connected to"
-	DEVICE_SUFFIX_OFFLINE    = "offline"
-	DEVICE_AWAKE             = "interactiveState=INTERACTIVE_STATE_AWAKE"
-	DEVICE_ASLEEP            = "interactiveState=INTERACTIVE_STATE_SLEEP"
-	DEVICE_LOCKED            = "mInputRestricted=true"
-	DEVICE_UNLOCKED          = "mInputRestricted=false"
+	IP_PORT_REGEXP                 = `(\d+\.\d+\.\d+\.\d+):\d+`
+	DEVICE_LIST_TITLE_LINE         = "List of devices attached"
+	DEVICE_SUFFIX_CONNECTED        = "device"
+	DEVICE_INET_REGEXP             = `(inet\s)(\d+\.\d+\.\d+\.\d+)`
+	DEVICE_TCPIP_CONNECTED         = "connected to"
+	TCPIP_ALLREADY_CONNECTED       = "already connected to"
+	DEVICE_SUFFIX_OFFLINE          = "offline"
+	DEVICE_AWAKE                   = "interactiveState=INTERACTIVE_STATE_AWAKE"
+	DEVICE_ASLEEP                  = "interactiveState=INTERACTIVE_STATE_SLEEP"
+	DEVICE_LOCKED                  = "mInputRestricted=true"
+	DEVICE_UNLOCKED                = "mInputRestricted=false"
+	_DEVIVE_SELFCHECK_INTERVAL_SEC = 10
 )
 
 type Message struct {
-	Cmd    string
-	Return string
+	Cmd            string
+	UsingCableConn bool
 }
 type Device struct {
 	IP                   string
@@ -36,8 +37,20 @@ type Device struct {
 	WireConnected        bool
 	WireRefreshToken     int64
 	WirelessRefreshToken int64
-	Invalid              bool
+	Invalid              chan bool
 	Idle                 bool
+	C                    chan Message
+}
+
+func (d *Device) listenToCmdAndRun() {
+	go func() {
+		for {
+			fmt.Printf("device %v listenToCmdAndRun", d.SN)
+			msg := <-d.C
+			d.adbShellCmd(msg.UsingCableConn, msg.Cmd)
+		}
+	}()
+
 }
 
 func isIPPortValid(ip_port string) (string, bool) {
@@ -58,7 +71,7 @@ func newDevice() *Device {
 }
 
 type ADBServer struct {
-	Devices []Device
+	Devices []*Device
 }
 
 func adbCmd(args ...string) []byte {
@@ -139,7 +152,29 @@ func (d *Device) getIP() {
 		}
 	}
 }
+func (d *Device) goSelfCheck() {
+	ticker := time.NewTicker(_DEVIVE_SELFCHECK_INTERVAL_SEC * time.Second)
+	go func() {
+		for {
+			select {
+			case <-d.Invalid:
+				fmt.Printf("device %v is Invalid", d.SN)
+				return
+			case <-ticker.C:
+				if d.adbShellCmd(true, "getprop ro.boot.serialno") == nil {
+					d.WireConnected = false
 
+				} else if d.adbShellCmd(false, "getprop ro.boot.serialno") == nil {
+					d.WirelessConnected = false
+				}
+				if !d.WireConnected && !d.WirelessConnected {
+					d.Invalid <- false
+				}
+			}
+		}
+	}()
+
+}
 func (d *Device) connect() bool {
 	ret := adbCmd("connect", d.IP_Port())
 	if strings.Contains(string(ret), DEVICE_TCPIP_CONNECTED) {
@@ -165,20 +200,18 @@ func (d *Device) UnlockPhone() {
 	out := string(d.adbShellCmd(true, "dumpsys window policy"))
 	if strings.Contains(out, DEVICE_ASLEEP) { // screen off
 		d.adbShellCmd(true, "input keyevent POWER")
+		time.Sleep(200 * time.Millisecond) // waiting for the phone's screen on
 		out = string(d.adbShellCmd(true, "dumpsys window policy"))
 	}
 	if strings.Contains(out, DEVICE_AWAKE) {
 		if strings.Contains(out, DEVICE_LOCKED) {
-			//d.Password
 			if d.Password == "" {
 				d.adbShellCmd(true, "input text 000000")
 			} else {
 				d.adbShellCmd(true, fmt.Sprintf("input text %s", d.Password))
 			}
-
-			d.adbShellCmd(true, "input keyevent 66")
 		} else if strings.Contains(out, DEVICE_UNLOCKED) {
-			fmt.Println("unlocked")
+			fmt.Printf("unlocked %s", d.SN)
 		}
 	}
 }
@@ -187,9 +220,9 @@ func (s *ADBServer) getNonFreshedDevice(sn_or_ipPort string, refreshToken int64)
 	for id, d := range s.Devices {
 		if d.SN == sn_or_ipPort || d.IP_Port() == sn_or_ipPort {
 			if refreshToken != d.WireRefreshToken || refreshToken != d.WirelessRefreshToken {
-				return &s.Devices[id], false
+				return s.Devices[id], false
 			}
-			return &s.Devices[id], true
+			return s.Devices[id], true
 		}
 	}
 	return nil, false
@@ -197,15 +230,15 @@ func (s *ADBServer) getNonFreshedDevice(sn_or_ipPort string, refreshToken int64)
 func (s *ADBServer) GetDevice(sn_or_ipPort string) *Device {
 	for _, d := range s.Devices {
 		if d.SN == sn_or_ipPort || d.IP_Port() == sn_or_ipPort {
-			return &d
+			return d
 		}
 	}
 	return nil
 }
 func (s *ADBServer) GetFirstAvailableDevice() *Device {
 	for _, d := range s.Devices {
-		if !d.Invalid && d.Idle {
-			return &d
+		if d.Idle {
+			return d
 		}
 	}
 	return nil
@@ -229,11 +262,11 @@ func (s *ADBServer) RefreshDevice() {
 				if strings.Contains(deviceStatus, DEVICE_SUFFIX_CONNECTED) {
 					d.WirelessConnected = true
 				} else if strings.Contains(deviceStatus, DEVICE_SUFFIX_OFFLINE) {
-					d.Invalid = true
+					// d.Invalid = true
 					d.Idle = true
 					connected := d.reconnect() // try reconnect
 					if connected {
-						d.Invalid = false
+						// d.Invalid = false
 						d.WirelessConnected = true
 					} else { // reconnect failed
 						d.WirelessConnected = false
@@ -244,7 +277,7 @@ func (s *ADBServer) RefreshDevice() {
 		} else if d == nil { // new device
 			nd := newDevice()
 			nd.Idle = true
-			nd.Invalid = false
+			// nd.Invalid = false
 			if ip_port == "" {
 				nd.SN = deviceId
 				nd.WireConnected = true
@@ -272,7 +305,7 @@ func (s *ADBServer) RefreshDevice() {
 					nd.WirelessRefreshToken = timestamp
 				}
 			}
-			s.Devices = append(s.Devices, *nd)
+			s.Devices = append(s.Devices, nd)
 		}
 	}
 	for id, _ := range s.Devices {
@@ -288,11 +321,13 @@ func (s *ADBServer) RefreshDevice() {
 			}
 		}
 		if !s.Devices[id].WireConnected && !s.Devices[id].WirelessConnected {
-			s.Devices[id].Invalid = false
+			// s.Devices[id].Invalid = false
 			s.Devices[id].Idle = false
 		}
-		// if s.Devices[id].Idle && !s.Devices[id].Invalid {
-		// 	s.Devices[id].unlockPhone()
-		// }
+		if s.Devices[id].Idle {
+			//  && !s.Devices[id].Invalid{
+			s.Devices[id].listenToCmdAndRun()
+			s.Devices[id].goSelfCheck()
+		}
 	}
 }
