@@ -1,0 +1,13 @@
+{
+	"airtestexe":"AirtestIDE.exe",
+	"taskrun":[
+{
+	"jobname":"jobName1",
+	"testcase":"login.air"},
+{"testcase":"newaccount.air","device":""},
+{
+	"jobname":"jobName2",
+	"testcase":"login.air","device":""},
+{"testcase":"newaccount.air"}
+]
+}
