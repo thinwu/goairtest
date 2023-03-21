@@ -15,10 +15,11 @@ const (
 )
 
 type SingleRun struct {
-	TestCase string `json:"testcase"`
-	Device   string `json:"device"`
-	JobName  string `json:"jobname"`
-	Build    string
+	TestCase        string `json:"testcase"`
+	Device          string `json:"device"`
+	DeviceUnlockPwd string `json:"deviceunlockpwd"`
+	JobName         string `json:"jobname"`
+	Build           string
 }
 
 type TestingTasks struct {
@@ -26,18 +27,21 @@ type TestingTasks struct {
 	TaskRun    []SingleRun `json:"taskrun"`
 }
 
-func (sr *SingleRun) runTest(adbserver *adb.ADBServer) string { // return report file path
-	var device *adb.Device
-	if sr.Device != "" {
-		device = adbserver.GetDevice(sr.Device)
-	} else {
-		device = adbserver.GetFirstAvailableDevice()
+func (sr *SingleRun) runTest(s *adb.AdbServer) string { // return report file path
+	log.Printf("%v", adb.DEVICE_INSTALL_APK_ARGS)
+	log.Printf("%v", adb.DEVICE_INSTALL_APK_CMD)
+	s.CmdChan <- adb.Message{
+		Cmd:            adb.DEVICE_INSTALL_APK_CMD,
+		Args:           fmt.Sprintf(adb.DEVICE_INSTALL_APK_ARGS, sr.Build),
+		Device:         sr.Device,
+		UsingCableConn: false,
 	}
-	println("InstallAPK.... %v, %v", device.SN, sr.Build)
-	device.InstallAPK(false, sr.Build)
-	println("InstallAPK finished UnlockPhone %v", device.SN)
-	device.UnlockPhone()
-	println("Unlocked %v", device.SN)
+	s.CmdChan <- adb.Message{
+		Cmd:            adb.DEVICE_UNLOCK_PHONE,
+		Args:           fmt.Sprintf(adb.DEVICE_INSTALL_APK_ARGS, sr.DeviceUnlockPwd),
+		Device:         sr.Device,
+		UsingCableConn: false,
+	}
 	return ""
 
 }
@@ -52,7 +56,7 @@ func (tt *TestingTasks) getSingleRunByJobName(jobName string) []SingleRun {
 	return srList
 }
 
-func (tt *TestingTasks) TryRunTestingTask(build, jobName string, adbserver *adb.ADBServer) {
+func (tt *TestingTasks) TryRunTestingTask(build, jobName string, adbserver *adb.AdbServer) {
 	var srList = tt.getSingleRunByJobName(jobName)
 	for _, sr := range srList {
 		sr.Build = build
