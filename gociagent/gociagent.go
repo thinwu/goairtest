@@ -10,7 +10,7 @@ import (
 	"os"
 )
 
-var adbserver *adb.ADBServer
+var adbserver *adb.AdbServer
 var testingTasks *poco.TestingTasks
 
 func main() {
@@ -64,8 +64,5 @@ func reportself(w http.ResponseWriter, r *http.Request) {
 
 func DeviceMonitor() {
 	fmt.Println("DeviceMonitor")
-	adbserver = &adb.ADBServer{
-		Devices: make([]*adb.Device, 0),
-	}
-	adbserver.GoRefreshDevice()
+	adbserver = adb.NewAdbServer()
 }
